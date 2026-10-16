@@ -59,7 +59,8 @@ public class PaymentSessionTest {
     private static final NetworkParameters TESTNET = TestNet3Params.get();
     private static final NetworkParameters MAINNET = MainNetParams.get();
 
-    private static final String simplePaymentUrl = "http://a.simple.url.com/";
+    /** RFC 5737 documentation address: public, and not loopback, link-local, or RFC 1918. */
+    private static final String simplePaymentUrl = "http://192.0.2.1/";
     private static final String paymentRequestMemo = "send coinz noa plz kthx";
     private static final String paymentMemo = "take ze coinz";
     private static final ByteString merchantData = ByteString.copyFromUtf8("merchant data");
