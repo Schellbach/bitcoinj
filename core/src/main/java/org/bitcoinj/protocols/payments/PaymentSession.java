@@ -38,10 +38,13 @@ import javax.annotation.Nullable;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.HttpURLConnection;
+import java.net.InetAddress;
 import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.net.URLConnection;
+import java.net.UnknownHostException;
 import java.security.KeyStoreException;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -134,6 +137,7 @@ public class PaymentSession {
         if (url == null)
             throw new PaymentProtocolException.InvalidPaymentRequestURL("No payment request URL (r= parameter) in BitcoinURI " + uri);
         try {
+            checkPaymentRequestUrl(url);
             return ListenableCompletableFuture.of(fetchPaymentRequest(new URI(url), verifyPki, trustStoreLoader));
         } catch (URISyntaxException e) {
             throw new PaymentProtocolException.InvalidPaymentRequestURL(e);
@@ -176,15 +180,16 @@ public class PaymentSession {
         if (url == null)
             throw new PaymentProtocolException.InvalidPaymentRequestURL("null paymentRequestUrl");
         try {
+            checkPaymentRequestUrl(url);
             return ListenableCompletableFuture.of(fetchPaymentRequest(new URI(url), verifyPki, trustStoreLoader));
-        } catch(URISyntaxException e) {
+        } catch (URISyntaxException e) {
             throw new PaymentProtocolException.InvalidPaymentRequestURL(e);
         }
     }
 
     private static CompletableFuture<PaymentSession> fetchPaymentRequest(final URI uri, final boolean verifyPki, @Nullable final TrustStoreLoader trustStoreLoader) {
         return CompletableFuture.supplyAsync((FutureUtils.ThrowingSupplier<PaymentSession>) () -> {
-            HttpURLConnection connection = (HttpURLConnection)uri.toURL().openConnection();
+            HttpURLConnection connection = openHttpConnection(uri.toURL(), true);
             connection.setRequestProperty("Accept", PaymentProtocol.MIMETYPE_PAYMENTREQUEST);
             connection.setUseCaches(false);
             Protos.PaymentRequest paymentRequest = Protos.PaymentRequest.parseFrom(connection.getInputStream());
@@ -353,9 +358,12 @@ public class PaymentSession {
             return ListenableCompletableFuture.failedFuture(new PaymentProtocolException.Expired("PaymentRequest is expired"));
         URL url;
         try {
+            checkPaymentUrl(paymentDetails.getPaymentUrl());
             url = new URL(paymentDetails.getPaymentUrl());
         } catch (MalformedURLException e) {
             return ListenableCompletableFuture.failedFuture(new PaymentProtocolException.InvalidPaymentURL(e));
+        } catch (PaymentProtocolException e) {
+            return ListenableCompletableFuture.failedFuture(e);
         }
         return ListenableCompletableFuture.of(sendPayment(url, payment));
     }
@@ -381,7 +389,7 @@ public class PaymentSession {
     @VisibleForTesting
     protected CompletableFuture<PaymentProtocol.Ack> sendPayment(final URL url, final Protos.Payment payment) {
         return CompletableFuture.supplyAsync((FutureUtils.ThrowingSupplier<PaymentProtocol.Ack>) () -> {
-            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            HttpURLConnection connection = openHttpConnection(url, false);
             connection.setRequestMethod("POST");
             connection.setRequestProperty("Content-Type", PaymentProtocol.MIMETYPE_PAYMENT);
             connection.setRequestProperty("Accept", PaymentProtocol.MIMETYPE_PAYMENTACK);
@@ -453,5 +461,188 @@ public class PaymentSession {
     /** Returns the protobuf that describes the payment to be made. */
     public Protos.PaymentDetails getPaymentDetails() {
         return paymentDetails;
+    }
+
+    /**
+     * Rejects a BIP70 {@code payment_url} that is not an {@code http} or {@code https} URL, or whose host
+     * resolves to a loopback, unspecified, link-local, RFC 1918, or IPv6-equivalent address.
+     * Unresolvable hosts are rejected. See CVE-2026-111210.
+     */
+    @VisibleForTesting
+    static void checkPaymentUrl(String url) throws PaymentProtocolException {
+        rejectDisallowed(url, false);
+    }
+
+    /**
+     * Rejects a BIP70 payment-request URL (the {@code r} parameter, or the URL passed to
+     * {@link #createFromUrl(String)}) that is not an allowed public {@code http} or {@code https} target.
+     */
+    @VisibleForTesting
+    static void checkPaymentRequestUrl(String url) throws PaymentProtocolException {
+        rejectDisallowed(url, true);
+    }
+
+    /**
+     * Returns true for addresses that must not be contacted while fetching or submitting a BIP70 payment.
+     * IPv4-mapped, IPv4-compatible, and NAT64 forms are unwrapped so an embedded private address is not
+     * reachable by writing it as IPv6.
+     */
+    @VisibleForTesting
+    static boolean isDisallowedPaymentAddress(InetAddress address) {
+        if (address == null)
+            return true;
+        if (address.isAnyLocalAddress()
+                || address.isLoopbackAddress()
+                || address.isLinkLocalAddress()
+                || address.isSiteLocalAddress()
+                || address.isMulticastAddress())
+            return true;
+        byte[] bytes = address.getAddress();
+        if (bytes.length != 16)
+            return false;
+        // fc00::/7 unique local (RFC 4193), the IPv6 equivalent of RFC 1918.
+        // InetAddress.isSiteLocalAddress() covers only the deprecated fec0::/10 prefix.
+        if ((bytes[0] & 0xfe) == 0xfc)
+            return true;
+        // 64:ff9b:1::/48 is reserved for local-use NAT64. A non-zero u octet is not a valid embedding.
+        if (isNat64LocalPrefix(bytes) && bytes[8] != 0)
+            return true;
+        byte[] embedded = embeddedIpv4(bytes);
+        if (embedded == null)
+            return false;
+        try {
+            return isDisallowedPaymentAddress(InetAddress.getByAddress(embedded));
+        } catch (UnknownHostException e) {
+            return true;
+        }
+    }
+
+    private static void rejectDisallowed(String urlString, boolean requestUrl) throws PaymentProtocolException {
+        final String what = requestUrl ? "Payment request URL" : "Payment URL";
+        if (urlString == null)
+            throw rejected(requestUrl, what + " is null");
+        final URL url;
+        try {
+            url = new URL(urlString);
+        } catch (MalformedURLException e) {
+            throw rejected(requestUrl, e);
+        }
+        final URI uri;
+        try {
+            uri = new URI(urlString);
+        } catch (URISyntaxException e) {
+            throw rejected(requestUrl, e);
+        }
+        String scheme = url.getProtocol();
+        if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))
+            throw rejected(requestUrl, what + " scheme must be http or https");
+        if (uri.getScheme() == null || !uri.getScheme().equalsIgnoreCase(scheme))
+            throw rejected(requestUrl, what + " scheme must be http or https");
+        String host = normalizeHost(url.getHost());
+        String uriHost = normalizeHost(uri.getHost());
+        // URL and URI disagreeing on the host is how a number of obfuscated targets parse. Fail closed.
+        if (host == null || uriHost == null || !host.equalsIgnoreCase(uriHost))
+            throw rejected(requestUrl, what + " host is not allowed");
+        final InetAddress[] addresses;
+        try {
+            addresses = InetAddress.getAllByName(host);
+        } catch (UnknownHostException | SecurityException e) {
+            throw rejected(requestUrl, e);
+        }
+        if (addresses == null || addresses.length == 0)
+            throw rejected(requestUrl, what + " host could not be resolved");
+        // Every address must be allowed. A name that resolves to a mix of public and local addresses is rejected.
+        for (InetAddress address : addresses) {
+            if (isDisallowedPaymentAddress(address))
+                throw rejected(requestUrl, what + " resolves to a disallowed network address");
+        }
+    }
+
+    /**
+     * Opens an HTTP(S) connection after re-checking the target. Redirects are disabled so a public URL cannot
+     * 30x the wallet onto a loopback, link-local, or private address.
+     */
+    private static HttpURLConnection openHttpConnection(URL url, boolean requestUrl) throws IOException, PaymentProtocolException {
+        if (requestUrl)
+            checkPaymentRequestUrl(url.toString());
+        else
+            checkPaymentUrl(url.toString());
+        URLConnection opened = url.openConnection();
+        if (!(opened instanceof HttpURLConnection))
+            throw rejected(requestUrl, (requestUrl ? "Payment request URL" : "Payment URL") + " scheme must be http or https");
+        HttpURLConnection connection = (HttpURLConnection) opened;
+        connection.setInstanceFollowRedirects(false);
+        return connection;
+    }
+
+    private static PaymentProtocolException rejected(boolean requestUrl, String message) {
+        if (requestUrl)
+            return new PaymentProtocolException.InvalidPaymentRequestURL(message);
+        return new PaymentProtocolException.InvalidPaymentURL(message);
+    }
+
+    private static PaymentProtocolException rejected(boolean requestUrl, Exception cause) {
+        if (requestUrl)
+            return new PaymentProtocolException.InvalidPaymentRequestURL(cause);
+        return new PaymentProtocolException.InvalidPaymentURL(cause);
+    }
+
+    @Nullable
+    private static String normalizeHost(@Nullable String host) {
+        if (host == null)
+            return null;
+        String trimmed = host.trim();
+        if (trimmed.startsWith("[") && trimmed.endsWith("]") && trimmed.length() > 2)
+            trimmed = trimmed.substring(1, trimmed.length() - 1);
+        if (trimmed.isEmpty())
+            return null;
+        return trimmed;
+    }
+
+    /**
+     * IPv4 address embedded in an IPv6 address, or null when {@code bytes} is not one of the well-known embeddings.
+     * Recognizes IPv4-mapped ({@code ::ffff:0:0/96}), deprecated IPv4-compatible ({@code ::/96}),
+     * well-known NAT64 ({@code 64:ff9b::/96}), and local-use NAT64 ({@code 64:ff9b:1::/48}).
+     */
+    @Nullable
+    private static byte[] embeddedIpv4(byte[] bytes) {
+        if (isIpv4Mapped(bytes) || isIpv4Compatible(bytes) || isNat64WellKnown(bytes))
+            return new byte[] { bytes[12], bytes[13], bytes[14], bytes[15] };
+        if (isNat64LocalPrefix(bytes) && bytes[8] == 0)
+            return new byte[] { bytes[6], bytes[7], bytes[9], bytes[10] };
+        return null;
+    }
+
+    private static boolean isIpv4Mapped(byte[] bytes) {
+        for (int i = 0; i < 10; i++) {
+            if (bytes[i] != 0)
+                return false;
+        }
+        return (bytes[10] & 0xff) == 0xff && (bytes[11] & 0xff) == 0xff;
+    }
+
+    /** Deprecated IPv4-compatible form {@code ::a.b.c.d}, excluding {@code ::} and {@code ::1}. */
+    private static boolean isIpv4Compatible(byte[] bytes) {
+        for (int i = 0; i < 12; i++) {
+            if (bytes[i] != 0)
+                return false;
+        }
+        boolean onlyFinalByte = bytes[12] == 0 && bytes[13] == 0 && bytes[14] == 0;
+        if (onlyFinalByte && (bytes[15] == 0 || bytes[15] == 1))
+            return false;
+        return true;
+    }
+
+    /** RFC 6052 well-known prefix {@code 64:ff9b::/96}. */
+    private static boolean isNat64WellKnown(byte[] bytes) {
+        return bytes[0] == 0x00 && bytes[1] == 0x64 && bytes[2] == (byte) 0xff && bytes[3] == (byte) 0x9b
+                && bytes[4] == 0 && bytes[5] == 0 && bytes[6] == 0 && bytes[7] == 0
+                && bytes[8] == 0 && bytes[9] == 0 && bytes[10] == 0 && bytes[11] == 0;
+    }
+
+    /** RFC 8215 local-use prefix {@code 64:ff9b:1::/48}. */
+    private static boolean isNat64LocalPrefix(byte[] bytes) {
+        return bytes[0] == 0x00 && bytes[1] == 0x64 && bytes[2] == (byte) 0xff && bytes[3] == (byte) 0x9b
+                && bytes[4] == 0x00 && bytes[5] == 0x01;
     }
 }
