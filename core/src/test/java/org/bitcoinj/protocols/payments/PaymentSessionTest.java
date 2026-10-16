@@ -34,19 +34,25 @@ import org.bitcoinj.core.TransactionOutput;
 import org.bitcoinj.crypto.TrustStoreLoader;
 import org.bitcoinj.params.MainNetParams;
 import org.bitcoinj.params.TestNet3Params;
+import org.bitcoinj.uri.BitcoinURI;
 import org.bitcoinj.utils.ListenableCompletableFuture;
 import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
 
 import java.io.InputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 
 import static org.bitcoinj.base.Coin.COIN;
 import static org.junit.Assert.assertEquals;
@@ -59,7 +65,8 @@ public class PaymentSessionTest {
     private static final NetworkParameters TESTNET = TestNet3Params.get();
     private static final NetworkParameters MAINNET = MainNetParams.get();
 
-    private static final String simplePaymentUrl = "http://a.simple.url.com/";
+    /** Public https payment URL. Must stay globally routable so the SSRF check allows the send. */
+    private static final String simplePaymentUrl = "https://1.1.1.1/";
     private static final String paymentRequestMemo = "send coinz noa plz kthx";
     private static final String paymentMemo = "take ze coinz";
     private static final ByteString merchantData = ByteString.copyFromUtf8("merchant data");
@@ -152,6 +159,116 @@ public class PaymentSessionTest {
     }
 
     @Test
+    public void testSendPaymentRejectsBlockedPaymentUrls() throws Exception {
+        tx.addInput(new TransactionInput(tx, outputToMe.getScriptBytes(), TransactionOutPoint.UNCONNECTED));
+        String[] blocked = {
+                "file:///etc/passwd",
+                "ftp://1.1.1.1/file",
+                "jar:file:///tmp/x.jar!/y",
+                "gopher://1.1.1.1/",
+                "http://127.0.0.1/pay",
+                "http://127.0.0.1:8332/pay",
+                "https://127.0.0.1/pay",
+                "http://localhost/pay",
+                "http://[::1]/pay",
+                "http://10.1.2.3/pay",
+                "http://172.16.0.1/pay",
+                "http://192.168.1.1/pay",
+                "http://169.254.169.254/latest/meta-data/",
+                "http://0.0.0.0/",
+                "http://[fc00::1]/",
+                "http://[fe80::1]/",
+                "http://2130706433/",
+                "http://127.1/",
+                "http://[::ffff:127.0.0.1]/",
+                "http://[::ffff:10.1.2.3]/",
+                "http://[::ffff:169.254.169.254]/"
+        };
+        for (String blockedUrl : blocked) {
+            PaymentSession session = new PaymentSession(newPaymentRequest(blockedUrl), false);
+            CompletableFuture<PaymentProtocol.Ack> ack = session.sendPayment(Collections.singletonList(tx), null, null);
+            try {
+                ack.get(3, TimeUnit.SECONDS);
+                fail("expected blocked payment URL: " + blockedUrl);
+            } catch (ExecutionException e) {
+                assertTrue(blockedUrl + " -> " + e.getCause(),
+                        e.getCause() instanceof PaymentProtocolException.InvalidPaymentURL);
+            }
+        }
+    }
+
+    @Test
+    public void testSendPaymentDoesNotConnectToLoopback() throws Exception {
+        ServerSocket server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
+        server.setSoTimeout(300);
+        try {
+            tx.addInput(new TransactionInput(tx, outputToMe.getScriptBytes(), TransactionOutPoint.UNCONNECTED));
+            String url = "http://127.0.0.1:" + server.getLocalPort() + "/pay";
+            PaymentSession session = new PaymentSession(newPaymentRequest(url), false);
+            CompletableFuture<PaymentProtocol.Ack> ack = session.sendPayment(Collections.singletonList(tx), null, null);
+            try {
+                ack.get(3, TimeUnit.SECONDS);
+                fail("expected blocked loopback payment URL");
+            } catch (ExecutionException e) {
+                assertTrue(e.getCause() instanceof PaymentProtocolException.InvalidPaymentURL);
+            }
+            try {
+                server.accept();
+                fail("payment POST connected to a loopback listener");
+            } catch (SocketTimeoutException expected) {
+                // The blocked URL never opened a connection.
+            }
+        } finally {
+            server.close();
+        }
+    }
+
+    @Test
+    public void testCreateFromUrlRejectsBlockedTargets() throws Exception {
+        String[] blocked = {
+                "file:///etc/passwd",
+                "file://localhost/etc/passwd",
+                "ftp://1.1.1.1/file",
+                "jar:http://127.0.0.1!/foo",
+                "http://127.0.0.1/request",
+                "http://[::1]/request",
+                "http://10.0.0.1/",
+                "http://192.168.0.1/",
+                "http://169.254.169.254/latest/meta-data/",
+                "http://localhost/request"
+        };
+        for (String blockedUrl : blocked) {
+            try {
+                PaymentSession.createFromUrl(blockedUrl, false);
+                fail("expected blocked payment request URL: " + blockedUrl);
+            } catch (PaymentProtocolException.InvalidPaymentRequestURL expected) {
+                // Rejected before a connection is opened.
+            }
+        }
+    }
+
+    @Test
+    public void testCreateFromBitcoinUriRejectsLoopbackPaymentRequest() throws Exception {
+        BitcoinURI uri = BitcoinURI.of("bitcoin:?r=http://127.0.0.1/request");
+        try {
+            PaymentSession.createFromBitcoinUri(uri, false);
+            fail("expected blocked r= URL");
+        } catch (PaymentProtocolException.InvalidPaymentRequestURL expected) {
+            // Rejected before a connection is opened.
+        }
+    }
+
+    @Test
+    public void testPublicHttpPaymentUrlIsStillSubmitted() throws Exception {
+        String paymentUrl = "http://1.1.1.1/pay";
+        MockPaymentSession paymentSession = new MockPaymentSession(newPaymentRequest(paymentUrl));
+        tx.addInput(new TransactionInput(tx, outputToMe.getScriptBytes(), TransactionOutPoint.UNCONNECTED));
+        paymentSession.sendPayment(Collections.singletonList(tx), null, paymentMemo);
+        assertEquals(1, paymentSession.getPaymentLog().size());
+        assertEquals(paymentUrl, paymentSession.getPaymentLog().get(0).getUrl().toString());
+    }
+
+    @Test
     @Ignore("certificate expired")
     public void testPkiVerification() throws Exception {
         InputStream in = getClass().getResourceAsStream("pki_test.bitcoinpaymentrequest");
@@ -160,6 +277,25 @@ public class PaymentSessionTest {
                 new TrustStoreLoader.DefaultTrustStoreLoader().getKeyStore());
         assertEquals("www.bitcoincore.org", pkiData.displayName);
         assertEquals("The USERTRUST Network, Salt Lake City, US", pkiData.rootAuthorityName);
+    }
+
+    private Protos.PaymentRequest newPaymentRequest(String paymentUrl) {
+        Protos.Output.Builder outputBuilder = Protos.Output.newBuilder()
+                .setAmount(amount.value)
+                .setScript(ByteString.copyFrom(outputToMe.getScriptBytes()));
+        Protos.PaymentDetails paymentDetails = Protos.PaymentDetails.newBuilder()
+                .setNetwork("test")
+                .setTime(time.getEpochSecond())
+                .setPaymentUrl(paymentUrl)
+                .addOutputs(outputBuilder)
+                .setMemo(paymentRequestMemo)
+                .setMerchantData(merchantData)
+                .build();
+        return Protos.PaymentRequest.newBuilder()
+                .setPaymentDetailsVersion(1)
+                .setPkiType("none")
+                .setSerializedPaymentDetails(paymentDetails.toByteString())
+                .build();
     }
 
     private Protos.PaymentRequest newSimplePaymentRequest(String netID) {

@@ -76,6 +76,9 @@ import java.util.concurrent.ExecutorService;
  * as a confirmation message that the payment is now "processing" or that an error occurred, and then broadcast the
  * tx itself later if needed.</p>
  *
+ * <p>URLs used to fetch a payment request, and {@code payment_url} values used to submit a payment, must be
+ * {@code http} or {@code https} and must not address a loopback, link-local, or private host.</p>
+ *
  * @see <a href="https://github.com/bitcoin/bips/blob/master/bip-0070.mediawiki">BIP 0070</a>
  * @deprecated The BIP 70 payment protocol will be removed in the next release.
  */
@@ -135,7 +138,9 @@ public class PaymentSession {
             throw new PaymentProtocolException.InvalidPaymentRequestURL("No payment request URL (r= parameter) in BitcoinURI " + uri);
         try {
             return ListenableCompletableFuture.of(fetchPaymentRequest(new URI(url), verifyPki, trustStoreLoader));
-        } catch (URISyntaxException e) {
+        } catch (URISyntaxException | MalformedURLException | IllegalArgumentException e) {
+            throw new PaymentProtocolException.InvalidPaymentRequestURL(e);
+        } catch (PaymentProtocolException.InvalidPaymentURL e) {
             throw new PaymentProtocolException.InvalidPaymentRequestURL(e);
         }
     }
@@ -177,14 +182,20 @@ public class PaymentSession {
             throw new PaymentProtocolException.InvalidPaymentRequestURL("null paymentRequestUrl");
         try {
             return ListenableCompletableFuture.of(fetchPaymentRequest(new URI(url), verifyPki, trustStoreLoader));
-        } catch(URISyntaxException e) {
+        } catch (URISyntaxException | MalformedURLException | IllegalArgumentException e) {
+            throw new PaymentProtocolException.InvalidPaymentRequestURL(e);
+        } catch (PaymentProtocolException.InvalidPaymentURL e) {
             throw new PaymentProtocolException.InvalidPaymentRequestURL(e);
         }
     }
 
-    private static CompletableFuture<PaymentSession> fetchPaymentRequest(final URI uri, final boolean verifyPki, @Nullable final TrustStoreLoader trustStoreLoader) {
+    private static CompletableFuture<PaymentSession> fetchPaymentRequest(final URI uri, final boolean verifyPki, @Nullable final TrustStoreLoader trustStoreLoader)
+            throws PaymentProtocolException.InvalidPaymentURL, MalformedURLException {
+        // Reject blocked targets before scheduling the request. open() checks again at connect time.
+        final URL validated = uri.toURL();
+        PaymentUrls.check(validated);
         return CompletableFuture.supplyAsync((FutureUtils.ThrowingSupplier<PaymentSession>) () -> {
-            HttpURLConnection connection = (HttpURLConnection)uri.toURL().openConnection();
+            HttpURLConnection connection = PaymentUrls.open(validated);
             connection.setRequestProperty("Accept", PaymentProtocol.MIMETYPE_PAYMENTREQUEST);
             connection.setUseCaches(false);
             Protos.PaymentRequest paymentRequest = Protos.PaymentRequest.parseFrom(connection.getInputStream());
@@ -353,9 +364,9 @@ public class PaymentSession {
             return ListenableCompletableFuture.failedFuture(new PaymentProtocolException.Expired("PaymentRequest is expired"));
         URL url;
         try {
-            url = new URL(paymentDetails.getPaymentUrl());
-        } catch (MalformedURLException e) {
-            return ListenableCompletableFuture.failedFuture(new PaymentProtocolException.InvalidPaymentURL(e));
+            url = PaymentUrls.parseAndCheck(paymentDetails.getPaymentUrl());
+        } catch (PaymentProtocolException.InvalidPaymentURL e) {
+            return ListenableCompletableFuture.failedFuture(e);
         }
         return ListenableCompletableFuture.of(sendPayment(url, payment));
     }
@@ -381,7 +392,7 @@ public class PaymentSession {
     @VisibleForTesting
     protected CompletableFuture<PaymentProtocol.Ack> sendPayment(final URL url, final Protos.Payment payment) {
         return CompletableFuture.supplyAsync((FutureUtils.ThrowingSupplier<PaymentProtocol.Ack>) () -> {
-            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            HttpURLConnection connection = PaymentUrls.open(url);
             connection.setRequestMethod("POST");
             connection.setRequestProperty("Content-Type", PaymentProtocol.MIMETYPE_PAYMENT);
             connection.setRequestProperty("Accept", PaymentProtocol.MIMETYPE_PAYMENTACK);
